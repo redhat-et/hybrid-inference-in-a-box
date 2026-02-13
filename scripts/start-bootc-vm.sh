@@ -82,7 +82,7 @@ fi
 
 # If still empty, query the GHCR API for the latest tag
 if [ -z "${IMAGE}" ]; then
-    GHCR_REPO="agullon/hybrid-inference-in-a-box"
+    GHCR_REPO="redhat-et/hybrid-inference-in-a-box"
     TOKEN=$(curl -fSs "https://ghcr.io/token?scope=repository:${GHCR_REPO}:pull" 2>/dev/null \
         | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])" 2>/dev/null || true)
     if [ -n "${TOKEN}" ]; then
