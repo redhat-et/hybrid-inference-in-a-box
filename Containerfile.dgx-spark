@@ -1,0 +1,207 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# hybrid-inference-in-a-box — NVIDIA DGX Spark (aarch64)
+#
+# Single-stage build: Fedora bootc rawhide + NVIDIA open drivers + MicroShift
+# + vLLM Semantic Router appliance
+# ═══════════════════════════════════════════════════════════════════════════════
+FROM quay.io/fedora/fedora-bootc:rawhide
+
+LABEL org.opencontainers.image.title="hybrid-inference-in-a-box-dgx-spark" \
+      org.opencontainers.image.description="Immutable bootc appliance: MicroShift + vLLM Semantic Router (NVIDIA DGX Spark)" \
+      org.opencontainers.image.source="https://github.com/redhat-et/hybrid-inference-in-a-box" \
+      org.opencontainers.image.vendor="Red Hat" \
+      org.opencontainers.image.base.name="quay.io/fedora/fedora-bootc:rawhide"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NVIDIA open kernel module build (DGX Spark / aarch64)
+# ─────────────────────────────────────────────────────────────────────────────
+# rpmfusion does not handle rawhide as a releasever well
+RUN echo 44 > /etc/dnf/vars/releasever
+RUN dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm \
+  https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm
+RUN dnf install -y 'dnf5-command(config-manager)'
+RUN dnf config-manager setopt fedora-cisco-openh264.enabled=1
+RUN dnf install -y rpmfusion-nonfree-release-tainted
+RUN dnf install -y akmod-nvidia-open xorg-x11-drv-nvidia-cuda
+RUN dnf install -y kernel-devel-matched
+RUN dnf install -y g++
+RUN mkdir -p /var/roothome
+RUN rpm -i /usr/src/akmods/nvidia-open-kmod.latest
+RUN curl https://raw.githubusercontent.com/CachyOS/kernel-patches/2da035a3/6.19/misc/nvidia/0003-Fix-compile-for-6.19.patch >> /root/rpmbuild/SOURCES/linker_fix.patch
+RUN rpmbuild -bs /root/rpmbuild/SPECS/nvidia-open-kmod.spec
+RUN cp /root/rpmbuild/SRPMS/nvidia-open-kmod-590.48.01-1.fc44.src.rpm /usr/src/akmods/nvidia-open-kmod-590.48.01-1.fc44.src.rpm
+RUN akmods --akmod nvidia-open-kmod --kernels 6.19.0-0.rc8.54.fc44.aarch64
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MicroShift OKD — install from upstream GitHub release RPMs
+# ─────────────────────────────────────────────────────────────────────────────
+# The microshift-io/microshift project publishes pre-built RPMs for aarch64.
+# We download the tarball, create a local repo, add the OpenShift mirror for
+# dependencies (cri-o, etc.), and install via dnf — following the same pattern
+# as the upstream quickrpm.sh installer.
+ARG MICROSHIFT_TAG=4.21.0_g29f429c21_4.21.0_okd_scos.ec.15
+
+# Download and extract the pre-built RPMs
+RUN mkdir -p /tmp/microshift-rpms && \
+    curl -fSsL --retry 5 --max-time 120 \
+      "https://github.com/microshift-io/microshift/releases/download/${MICROSHIFT_TAG}/microshift-rpms-$(uname -m).tgz" | \
+      tar zxf - -C /tmp/microshift-rpms
+
+# Create local repo for the MicroShift RPMs
+RUN printf '[microshift-local]\n\
+name=MicroShift Local Repository\n\
+baseurl=/tmp/microshift-rpms\n\
+enabled=1\n\
+gpgcheck=0\n\
+skip_if_unavailable=0\n' > /etc/yum.repos.d/microshift-local.repo
+
+# Add OpenShift mirror beta repo for dependencies (cri-o, crun, etc.)
+RUN USHIFT_VER=$(dnf --quiet --disablerepo="*" \
+      --repofrompath=ushift,file:///tmp/microshift-rpms \
+      --enablerepo=ushift repoquery --qf "%{VERSION}" microshift | cut -d. -f1,2) && \
+    printf '[openshift-mirror-beta]\n\
+name=OpenShift Mirror Beta Repository\n\
+baseurl=https://mirror.openshift.com/pub/openshift-v4/%s/dependencies/rpms/%s-el9-beta/\n\
+enabled=1\n\
+gpgcheck=0\n\
+skip_if_unavailable=0\n' "$(uname -m)" "${USHIFT_VER}" > /etc/yum.repos.d/microshift-deps.repo
+
+# Install MicroShift and dependencies
+# --setopt=install_weak_deps=False avoids pulling microshift-networking (not
+# needed when microshift-kindnet is installed)
+RUN dnf install -y --setopt=install_weak_deps=False \
+      microshift microshift-kindnet microshift-topolvm \
+      firewalld jq bash-completion skopeo && \
+    dnf clean all
+
+# Install CNI plugins from upstream GitHub (may not be available as RPM on Fedora)
+RUN if ! rpm -q containernetworking-plugins &>/dev/null; then \
+      CNP_VER=v1.8.0 && \
+      CNP_PKG="cni-plugins-linux-arm64-${CNP_VER}.tgz" && \
+      curl -sSL --retry 5 -o "/tmp/${CNP_PKG}" \
+        "https://github.com/containernetworking/plugins/releases/download/${CNP_VER}/${CNP_PKG}" && \
+      mkdir -p /usr/libexec/cni && \
+      tar zxf "/tmp/${CNP_PKG}" -C /usr/libexec/cni && \
+      rm -f "/tmp/${CNP_PKG}" ; \
+    fi
+
+# Clean up local repo (RPMs are now installed)
+RUN rm -rf /tmp/microshift-rpms /etc/yum.repos.d/microshift-local.repo
+
+# MicroShift sysctl tuning
+RUN printf 'fs.inotify.max_user_watches = 524288\nfs.inotify.max_user_instances = 16384\n' \
+      > /etc/sysctl.d/99-microshift.conf
+
+# With kindnet: disable openvswitch and systemd-resolved
+RUN systemctl disable openvswitch      2>/dev/null || true && \
+    systemctl disable systemd-resolved 2>/dev/null || true
+
+# Kubeconfig symlink for root
+RUN mkdir -p "$(readlink -f /root)/.kube" && \
+    ln -sf /var/lib/microshift/resources/kubeadmin/kubeconfig /root/.kube/config
+
+# Expose /var as a volume for idmap mounts under /var/lib/kubelet
+VOLUME ["/var"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Firewall rules
+# ─────────────────────────────────────────────────────────────────────────────
+RUN firewall-offline-cmd --add-service=ssh && \
+    firewall-offline-cmd --add-service=http && \
+    firewall-offline-cmd --add-service=https && \
+    # NodePort range for Kubernetes services
+    firewall-offline-cmd --add-port=30000-32767/tcp && \
+    firewall-offline-cmd --add-port=30000-32767/udp && \
+    # Pod and service network CIDRs (trusted for internal cluster traffic)
+    firewall-offline-cmd --zone=trusted --add-source=10.42.0.0/16 && \
+    firewall-offline-cmd --zone=trusted --add-source=169.254.169.1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Systemd services
+# ─────────────────────────────────────────────────────────────────────────────
+# OVN-Kubernetes requires rshared mount propagation on the root filesystem
+COPY scripts/make-rshared.service /etc/systemd/system/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TopoLVM storage — create a loopback-backed LVM volume group on first boot
+# ─────────────────────────────────────────────────────────────────────────────
+# MicroShift's TopoLVM CSI driver expects a volume group named "myvg1".
+# Since bootc images don't have a dedicated LVM partition, we create a
+# sparse loopback file and attach it as a PV on every boot (before MicroShift
+# starts). The file is only allocated on first boot; subsequent boots reuse it.
+COPY scripts/create-vg.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/create-vg.sh && \
+    printf '[Unit]\nDescription=Create loopback LVM VG for TopoLVM\nBefore=microshift.service\nAfter=local-fs.target\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/create-vg.sh\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n' \
+      > /etc/systemd/system/create-vg.service
+
+RUN systemctl enable firewalld microshift make-rshared create-vg
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Kustomize manifests — infrastructure only, no configuration baked in
+# ─────────────────────────────────────────────────────────────────────────────
+# MicroShift auto-applies kustomizations from /usr/lib/microshift/manifests.d/*/
+# on boot. These define the Deployments, Services, etc. but reference ConfigMaps
+# and Secrets that don't exist yet — pods will wait until
+# configure-semantic-router.sh creates them post-boot.
+COPY manifests/semantic-router/ /usr/lib/microshift/manifests.d/semantic-router/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration templates + helper scripts
+# ─────────────────────────────────────────────────────────────────────────────
+COPY config/templates/ /etc/semantic-router/templates/
+COPY config/llm-router-dashboard.json /etc/semantic-router/
+COPY scripts/configure-semantic-router.sh /usr/local/bin/
+COPY scripts/select-mode.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/configure-semantic-router.sh /usr/local/bin/select-mode.sh
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Default user — passwordless SSH for quick access to the appliance
+# ─────────────────────────────────────────────────────────────────────────────
+RUN useradd -M -d /var/home/admin -G wheel admin && \
+    passwd -d admin && \
+    echo "%wheel ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/wheel-nopasswd && \
+    chmod 440 /etc/sudoers.d/wheel-nopasswd && \
+    echo "d /var/home/admin 0700 admin admin -" > /etc/tmpfiles.d/admin-home.conf && \
+    sed -i 's/^#\?PermitEmptyPasswords.*/PermitEmptyPasswords yes/' /etc/ssh/sshd_config && \
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pre-pull container images for air-gapped operation
+# ─────────────────────────────────────────────────────────────────────────────
+# Images are saved to dir: format at build time (no user-namespace needed),
+# then copied into CRI-O's containers-storage at boot via a systemd
+# ExecStartPre hook — the same pattern used by upstream MicroShift.
+RUN cp /etc/subuid /etc/subuid.bak 2>/dev/null || true && \
+    cp /etc/subgid /etc/subgid.bak 2>/dev/null || true && \
+    echo "root:100000:65536" > /etc/subuid && \
+    echo "root:100000:65536" > /etc/subgid && \
+    IMAGES=" \
+      ghcr.io/vllm-project/semantic-router/vllm-sr:latest \
+      ghcr.io/vllm-project/semantic-router/extproc:latest \
+      docker.io/envoyproxy/envoy:v1.31.7 \
+      docker.io/prom/prometheus:v2.53.3 \
+      docker.io/grafana/grafana:11.4.0" && \
+    mkdir -p /usr/lib/containers/storage && \
+    for img in ${IMAGES}; do \
+      sha="$(echo "${img}" | sha256sum | awk '{print $1}')" && \
+      skopeo copy --preserve-digests \
+        "docker://${img}" "dir:/usr/lib/containers/storage/${sha}" && \
+      echo "${img},${sha}" >> /usr/lib/containers/storage/image-list.txt ; \
+    done && \
+    if [ -f /etc/subuid.bak ]; then mv /etc/subuid.bak /etc/subuid; fi && \
+    if [ -f /etc/subgid.bak ]; then mv /etc/subgid.bak /etc/subgid; fi
+
+# Install a systemd hook that copies the embedded images into CRI-O storage
+# on first boot, before MicroShift starts pulling pods.
+RUN printf '#!/bin/bash\nset -euo pipefail\n\
+IMG_LIST=/usr/lib/containers/storage/image-list.txt\n\
+[ -f "$IMG_LIST" ] || exit 0\n\
+while IFS="," read -r img sha; do\n\
+  skopeo copy --preserve-digests \\\n\
+    "dir:/usr/lib/containers/storage/${sha}" \\\n\
+    "containers-storage:${img}"\n\
+done < "$IMG_LIST"\n' > /usr/local/bin/embed-images.sh && \
+    chmod +x /usr/local/bin/embed-images.sh && \
+    mkdir -p /etc/systemd/system/microshift.service.d && \
+    printf '[Service]\nExecStartPre=/usr/local/bin/embed-images.sh\n' \
+      > /etc/systemd/system/microshift.service.d/embed-images.conf
