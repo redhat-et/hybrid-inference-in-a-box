@@ -13,32 +13,31 @@
 # uses model ordering (model_0, model_1, ...) in its routing decisions.
 
 providers:
+  defaults:
+    default_model: "Qwen/Qwen2.5-1.5B-Instruct"
   models:
     # External models — routed via HTTPS to a remote LLM endpoint
     - name: "Mistral-Small-24B-W8A8"
-      endpoints:
+      backend_refs:
         - name: "litellm"
           weight: 1
           endpoint: "litellm.example.com:443"
           protocol: "https"
-      access_key: "sk-your-key-here"
+          api_key: "sk-your-key-here"
 
     - name: "Granite-3.3-8B-Instruct"
-      endpoints:
+      backend_refs:
         - name: "litellm"
           weight: 1
           endpoint: "litellm.example.com:443"
           protocol: "https"
-      access_key: "sk-your-key-here"
+          api_key: "sk-your-key-here"
 
     # Local SLM — routed via HTTP to on-device vLLM (no API key needed)
     # Requires: GPU Operator installed (sudo setup-gpu-operator.sh)
     - name: "Qwen/Qwen2.5-1.5B-Instruct"
-      endpoints:
+      backend_refs:
         - name: "local-vllm"
           weight: 1
           endpoint: "vllm-slm.vllm-slm.svc.cluster.local:8000"
           protocol: "http"
-      access_key: "none"
-
-  default_model: "Qwen/Qwen2.5-1.5B-Instruct"

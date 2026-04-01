@@ -1,0 +1,37 @@
+version: v0.3
+listeners:
+  - name: "api"
+    address: "0.0.0.0"
+    port: 8801
+    timeout: "300s"
+providers:
+  defaults:
+    default_model: "test-model"
+  models:
+    - name: "test-model"
+      backend_refs:
+        - name: "local"
+          weight: 1
+          endpoint: "localhost:8000"
+          protocol: "http"
+          api_key: "test"
+routing:
+  modelCards:
+    - name: "test-model"
+  signals:
+    domains:
+      - name: "other"
+        description: "Test"
+        mmlu_categories: ["other"]
+  decisions:
+    - name: "default"
+      description: "Default"
+      priority: 1
+      rules:
+        operator: "OR"
+        conditions:
+          - type: "domain"
+            name: "other"
+      modelRefs:
+        - model: "test-model"
+          use_reasoning: false

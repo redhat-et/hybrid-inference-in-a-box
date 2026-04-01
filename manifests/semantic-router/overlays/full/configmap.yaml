@@ -1,0 +1,158 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: router-config
+  namespace: semantic-router
+data:
+  config.yaml: |
+    version: v0.3
+
+    listeners:
+      - name: "api"
+        address: "0.0.0.0"
+        port: 8801
+        timeout: "300s"
+
+    providers:
+      defaults:
+        default_model: "Mistral-Small-24B-W8A8"
+      models:
+        - name: "Mistral-Small-24B-W8A8"
+          backend_refs:
+            - name: "litellm"
+              weight: 1
+              endpoint: "litellm.example.com:443"
+              protocol: "https"
+              api_key: "sk-your-key-here"
+
+    routing:
+      modelCards:
+        - name: "Mistral-Small-24B-W8A8"
+
+      signals:
+        domains:
+          - name: "computer science"
+            description: "Computer science and programming"
+            mmlu_categories: ["computer science"]
+          - name: "engineering"
+            description: "Engineering and technical problem-solving"
+            mmlu_categories: ["engineering"]
+          - name: "math"
+            description: "Mathematics and quantitative reasoning"
+            mmlu_categories: ["math"]
+          - name: "physics"
+            description: "Physics and physical sciences"
+            mmlu_categories: ["physics"]
+          - name: "biology"
+            description: "Biology and life sciences"
+            mmlu_categories: ["biology"]
+          - name: "chemistry"
+            description: "Chemistry and chemical sciences"
+            mmlu_categories: ["chemistry"]
+          - name: "health"
+            description: "Health and medical information"
+            mmlu_categories: ["health"]
+          - name: "business"
+            description: "Business and management"
+            mmlu_categories: ["business"]
+          - name: "law"
+            description: "Legal questions and law"
+            mmlu_categories: ["law"]
+          - name: "psychology"
+            description: "Psychology and mental health"
+            mmlu_categories: ["psychology"]
+          - name: "history"
+            description: "Historical questions and culture"
+            mmlu_categories: ["history"]
+          - name: "economics"
+            description: "Economics and finance"
+            mmlu_categories: ["economics"]
+          - name: "philosophy"
+            description: "Philosophy and ethics"
+            mmlu_categories: ["philosophy"]
+          - name: "other"
+            description: "General knowledge and miscellaneous"
+            mmlu_categories: ["other"]
+
+      decisions:
+        - name: "coding"
+          description: "Route coding and engineering queries to coding model"
+          priority: 100
+          rules:
+            operator: "OR"
+            conditions:
+              - type: "domain"
+                name: "computer science"
+              - type: "domain"
+                name: "engineering"
+          modelRefs:
+            - model: "Mistral-Small-24B-W8A8"
+              use_reasoning: false
+          plugins:
+            - type: "router_replay"
+              configuration:
+                enabled: true
+                max_records: 200
+                capture_request_body: true
+                capture_response_body: true
+                max_body_bytes: 4096
+
+        - name: "science"
+          description: "Route science and research queries to external model"
+          priority: 90
+          rules:
+            operator: "OR"
+            conditions:
+              - type: "domain"
+                name: "biology"
+              - type: "domain"
+                name: "chemistry"
+              - type: "domain"
+                name: "physics"
+              - type: "domain"
+                name: "health"
+          modelRefs:
+            - model: "Mistral-Small-24B-W8A8"
+              use_reasoning: false
+          plugins:
+            - type: "router_replay"
+              configuration:
+                enabled: true
+                max_records: 200
+                capture_request_body: true
+                capture_response_body: true
+                max_body_bytes: 4096
+
+        - name: "general"
+          description: "Default route for all other queries"
+          priority: 1
+          rules:
+            operator: "OR"
+            conditions:
+              - type: "domain"
+                name: "other"
+              - type: "domain"
+                name: "math"
+              - type: "domain"
+                name: "business"
+              - type: "domain"
+                name: "law"
+              - type: "domain"
+                name: "psychology"
+              - type: "domain"
+                name: "history"
+              - type: "domain"
+                name: "economics"
+              - type: "domain"
+                name: "philosophy"
+          modelRefs:
+            - model: "Mistral-Small-24B-W8A8"
+              use_reasoning: false
+          plugins:
+            - type: "router_replay"
+              configuration:
+                enabled: true
+                max_records: 200
+                capture_request_body: true
+                capture_response_body: true
+                max_body_bytes: 4096

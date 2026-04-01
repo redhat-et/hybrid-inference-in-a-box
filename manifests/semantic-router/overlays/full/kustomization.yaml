@@ -2,7 +2,16 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - ../../base
+  - scc.yaml
+  - configmap.yaml
   - deployment.yaml
   - service.yaml
   - prometheus.yaml
   - grafana.yaml
+configMapGenerator:
+  - name: grafana-dashboard
+    namespace: semantic-router
+    files:
+      - llm-router-dashboard.json
+    options:
+      disableNameSuffixHash: true

@@ -1,5 +1,20 @@
 ARG MICROSHIFT_VERSION=4.21.0_g29f429c21_4.21.0_okd_scos.ec.15
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1: Pre-download semantic-router ML models (~18GB)
+# ─────────────────────────────────────────────────────────────────────────────
+# Run the vllm-sr router briefly to trigger model downloads into /root/.cache.
+# This runs directly in the vllm-sr image (no nested podman needed).
+FROM ghcr.io/vllm-project/semantic-router/vllm-sr:latest AS model-cache
+COPY scripts/preload-models-config.yaml /tmp/config.yaml
+RUN timeout 300 /app/start-router.sh /tmp/config.yaml /app/.vllm-sr || true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2: Main bootc appliance image
+# ─────────────────────────────────────────────────────────────────────────────
 FROM ghcr.io/microshift-io/microshift:${MICROSHIFT_VERSION}
+
+ARG ENABLE_GPU=true
 
 LABEL org.opencontainers.image.title="hybrid-inference-in-a-box" \
       org.opencontainers.image.description="Immutable bootc appliance: MicroShift + vLLM Semantic Router" \
@@ -40,18 +55,23 @@ RUN chmod +x /usr/local/bin/create-vg.sh && \
       > /etc/systemd/system/create-vg.service
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NVIDIA Container Toolkit + CDI — expose GPUs to CRI-O via CDI specs
+# NVIDIA Container Toolkit + CDI (GPU builds only)
 # ─────────────────────────────────────────────────────────────────────────────
 # The NVIDIA device plugin runs in CDI mode (required for integrated GPUs like
 # the GB10 / DGX Spark where NVML can't enumerate device memory). CDI specs
 # are generated on every boot before MicroShift starts.
-RUN dnf install -y nvidia-container-toolkit && dnf clean all
 COPY scripts/generate-nvidia-cdi.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/generate-nvidia-cdi.sh && \
-    printf '[Unit]\nDescription=Generate NVIDIA CDI specs for CRI-O\nBefore=microshift.service\nAfter=local-fs.target\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/generate-nvidia-cdi.sh\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n' \
-      > /etc/systemd/system/generate-nvidia-cdi.service
+    if [ "${ENABLE_GPU}" = "true" ]; then \
+      curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
+        -o /etc/yum.repos.d/nvidia-container-toolkit.repo && \
+      dnf install -y nvidia-container-toolkit && dnf clean all && \
+      printf '[Unit]\nDescription=Generate NVIDIA CDI specs for CRI-O\nBefore=microshift.service\nAfter=local-fs.target\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/generate-nvidia-cdi.sh\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n' \
+        > /etc/systemd/system/generate-nvidia-cdi.service && \
+      systemctl enable generate-nvidia-cdi ; \
+    fi
 
-RUN systemctl enable firewalld microshift make-rshared create-vg generate-nvidia-cdi
+RUN systemctl enable firewalld microshift make-rshared create-vg
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Kustomize manifests — infrastructure only, no configuration baked in
@@ -62,6 +82,9 @@ RUN systemctl enable firewalld microshift make-rshared create-vg generate-nvidia
 # configure-semantic-router.sh creates them post-boot.
 COPY manifests/semantic-router/ /usr/lib/microshift/manifests.d/semantic-router/
 COPY manifests/vllm-slm/ /usr/lib/microshift/manifests.d/vllm-slm/
+RUN if [ "${ENABLE_GPU}" != "true" ]; then \
+      rm -rf /usr/lib/microshift/manifests.d/vllm-slm/ ; \
+    fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration templates + helper scripts
@@ -69,15 +92,22 @@ COPY manifests/vllm-slm/ /usr/lib/microshift/manifests.d/vllm-slm/
 COPY config/templates/ /etc/semantic-router/templates/
 COPY config/llm-router-dashboard.json /etc/semantic-router/
 COPY scripts/configure-semantic-router.sh /usr/local/bin/
-COPY scripts/select-mode.sh /usr/local/bin/
 COPY scripts/setup-gpu-operator.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/configure-semantic-router.sh /usr/local/bin/select-mode.sh \
-    /usr/local/bin/setup-gpu-operator.sh
+RUN chmod +x /usr/local/bin/configure-semantic-router.sh \
+             /usr/local/bin/setup-gpu-operator.sh
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helm — needed to install the NVIDIA GPU Operator post-boot
+# Pre-downloaded semantic-router ML models (~18GB)
 # ─────────────────────────────────────────────────────────────────────────────
-RUN curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+# Copied from the model-cache build stage to avoid first-boot download delays
+COPY --from=model-cache /root/.cache /var/cache/vllm-sr
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helm — needed to install the NVIDIA GPU Operator post-boot (GPU builds only)
+# ─────────────────────────────────────────────────────────────────────────────
+RUN if [ "${ENABLE_GPU}" = "true" ]; then \
+      curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash ; \
+    fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Default user — passwordless SSH for quick access to the appliance
@@ -102,12 +132,12 @@ RUN cp /etc/subuid /etc/subuid.bak 2>/dev/null || true && \
     echo "root:100000:65536" > /etc/subgid && \
     IMAGES=" \
       ghcr.io/vllm-project/semantic-router/vllm-sr:latest \
-      ghcr.io/vllm-project/semantic-router/extproc:latest \
-      docker.io/envoyproxy/envoy:v1.31.7 \
       docker.io/prom/prometheus:v2.53.3 \
       docker.io/grafana/grafana:11.4.0 \
-      vllm/vllm-openai:latest \
       " && \
+    if [ "${ENABLE_GPU}" = "true" ]; then \
+      IMAGES="${IMAGES} vllm/vllm-openai:latest" ; \
+    fi && \
     mkdir -p /usr/lib/containers/storage && \
     for img in ${IMAGES}; do \
       sha="$(echo "${img}" | sha256sum | awk '{print $1}')" && \

@@ -16,12 +16,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: amd64
+        arch:
+          - name: amd64
             runner: ubuntu-latest
-          - arch: arm64
+          - name: arm64
             runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+        gpu:
+          - enabled: "false"
+            suffix: ""
+          - enabled: "true"
+            suffix: "-gpu"
+    runs-on: ${{ matrix.arch.runner }}
     permissions:
       contents: read
       packages: write
@@ -41,15 +46,16 @@ jobs:
         if: github.event_name != 'pull_request'
         run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
 
-      - name: Build image
+      - name: Build image (GPU=${{ matrix.gpu.enabled }})
         run: |
           sudo podman build \
-            --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }} \
+            --build-arg ENABLE_GPU=${{ matrix.gpu.enabled }} \
+            --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}${{ matrix.gpu.suffix }}-${{ matrix.arch.name }} \
             --file Containerfile .
 
       - name: Push arch-specific image
         if: github.event_name != 'pull_request'
-        run: sudo podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }}
+        run: sudo podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}${{ matrix.gpu.suffix }}-${{ matrix.arch.name }}
 
   manifest:
     if: github.event_name != 'pull_request'
@@ -57,6 +63,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       packages: write
+    strategy:
+      matrix:
+        variant:
+          - suffix: ""
+          - suffix: "-gpu"
 
     steps:
       - name: Log in to GHCR
@@ -68,13 +79,13 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=sha
-            type=ref,event=branch
+            type=sha,suffix=${{ matrix.variant.suffix }}
+            type=ref,event=branch,suffix=${{ matrix.variant.suffix }}
 
       - name: Create and push manifest lists
         run: |
-          AMD64=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
-          ARM64=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64
+          AMD64=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}${{ matrix.variant.suffix }}-amd64
+          ARM64=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}${{ matrix.variant.suffix }}-arm64
 
           echo '${{ steps.meta.outputs.tags }}' | while read -r tag; do
             [ -n "${tag}" ] || continue
